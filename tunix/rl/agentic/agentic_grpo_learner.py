@@ -523,8 +523,17 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
       policy_versions_list.append(policy_version)
       trajectory_rewards_list.append(item.traj.get("trajectory_reward"))
 
+    # Trajectories scored before a restart were logged and measured then.
+    scored_before_restart = (
+        self._sb_saved_rewards(trajectories, mode) is not None
+    )
+
     # Log trajectory.
-    if self._trajectory_logger and trajectories_to_log:
+    if (
+        self._trajectory_logger
+        and trajectories_to_log
+        and not scored_before_restart
+    ):
       for traj in trajectories_to_log:
         self._trajectory_logger.log_item_async(traj)
 
@@ -785,6 +794,7 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
           mode=mode,
           **reward_kwargs,
           expected_step=expected_step,
+          trajectory_items=trajectories,
       )
 
       advantage_estimator = function_registry.get_advantage_estimator(
@@ -880,7 +890,8 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
           step=expected_step,  # pyrefly: ignore[bad-argument-type]
       )
 
-    for metric_fn in self.metric_fns:
+    metric_fns = () if scored_before_restart else self.metric_fns
+    for metric_fn in metric_fns:
       user_defined_metric = metric_fn(
           prompts=original_inputs["prompts"],
           completions=completion_texts,

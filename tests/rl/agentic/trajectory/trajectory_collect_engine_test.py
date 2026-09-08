@@ -2235,6 +2235,7 @@ class ExactTokenContinuityCollectTest(absltest.TestCase):
         beta=0.0,
         use_rollout_logps=True,
     )
+    learner._sub_batch = None
     learner._trajectory_logger = None
     learner._full_batch_size = 0
     learner.metric_fns = []

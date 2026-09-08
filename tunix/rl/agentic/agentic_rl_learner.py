@@ -23,16 +23,19 @@ import contextlib
 import copy
 import dataclasses
 import itertools
+import os
 import queue
 import threading
 from typing import Any, AsyncIterator, Callable, Dict, Generic, Iterable, Iterator, List, Sequence, Type, TypeVar, Optional, Set
 
 from absl import logging
 import flax
+from flax import nnx
 import jax
 from jax import typing
 import jax.numpy as jnp
 import numpy as np
+from orbax.checkpoint import v1 as ocp
 from tunix.generate import utils as generate_utils
 from tunix.rl import algorithm_config as algo_config_lib
 from tunix.rl import common
@@ -40,9 +43,11 @@ from tunix.perf.experimental import constants as perf_constants
 from tunix.rl import function_registry
 from tunix.rl import reward_manager  # pylint: disable=unused-import
 from tunix.rl import rl_cluster as rl_engine_lib
+from tunix.rl import sub_batch_checkpoint
 from tunix.rl.rollout import base_rollout
 from tunix.rl import utils as rl_utils
 from tunix.rl.agentic import utils as agentic_utils
+from tunix.rl.agentic.agents import agent_types
 from tunix.rl.agentic.agents import base_agent
 from tunix.rl.agentic.agents import model_agent
 from tunix.rl.agentic.environments import base_environment
@@ -52,6 +57,7 @@ from tunix.rl.agentic.pipeline import rollout_orchestrator
 from tunix.rl.agentic.rewards import reward  # pylint: disable=unused-import
 from tunix.rl.agentic.trajectory import trajectory_collect_engine
 from tunix.rl.queue import data_queue as queue_lib
+from tunix.sft import checkpoint_options
 from tunix.sft import utils as sft_utils
 
 ArrayLike = typing.ArrayLike
@@ -82,6 +88,12 @@ class AgenticRLConfig(algo_config_lib.AlgorithmConfig):
     num_generations: Number of samples per prompt.
     num_iterations: Number of iterations per batch.
     episode_timeout: Timeout for each episode in seconds.
+    sub_batch_checkpointing: Whether to persist each global step's generated
+      rollouts so that a restart resumes the step instead of regenerating them.
+      Requires `training_config.checkpoint_root_directory` and trainer
+      checkpoints at every optimizer update. A restart must keep the dataset
+      and its order, the batch sizes, `gradient_accumulation_steps`,
+      `num_generations` and `num_iterations`; other settings may change.
   """
 
   system_prompt: str = ""
@@ -97,6 +109,7 @@ class AgenticRLConfig(algo_config_lib.AlgorithmConfig):
   filter_statuses: Optional[Set] = None
   overlong_filter: bool = False
   use_rollout_logps: bool = True
+  sub_batch_checkpointing: bool = False
 
 
 TConfig = TypeVar("TConfig", bound=AgenticRLConfig)
@@ -208,6 +221,17 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
             self.rl_engine.rollout.model(),
         )
     )
+    self._sub_batch: sub_batch_checkpoint.SubBatchCheckpointManager | None = (
+        None
+    )
+    # The restored in-progress step and, with replay epochs, the chunks its
+    # weights already hold. Packs per update vary, so with sequence packing
+    # the skip counts updates instead.
+    self._sb_resume: sub_batch_checkpoint.SubBatchState | None = None
+    self._sb_skip_chunks = 0
+    self._sb_skip_updates = 0
+    if self.algo_config.sub_batch_checkpointing:
+      self._check_sub_batch_config()
 
     # Enable async rollout if trainer and rollout are not on the same mesh.
     # If they do, then doesn't make sense for the interleave because they will
@@ -260,6 +284,206 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     self._eval_rewards_window: List[float] = []
     self._rewards_window_lock = threading.Lock()
 
+  def _init_sub_batch_checkpointing(self) -> None:
+    """Builds the sub-batch manager and restores an in-progress step.
+
+    Runs before the dataset fast-forward, which starts at the restored step.
+    """
+    if not self.algo_config.sub_batch_checkpointing:
+      return
+    root = self._training_config.checkpoint_root_directory
+    assert root is not None
+    options = checkpoint_options.resolve_checkpointing_defaults(
+        self._training_config.checkpointing_options
+    )
+    trainer = self.rl_engine.actor_trainer
+    self._sub_batch = sub_batch_checkpoint.SubBatchCheckpointManager(
+        os.path.join(root, "sub_batch"),
+        enable_async=bool(options.enable_async_checkpointing),
+    )
+    state = None
+    if trainer.checkpoint_manager.latest_step() is not None:
+      state = self._sub_batch.restore(trainer.train_steps)
+    elif self._sub_batch.has_snapshots():
+      raise ValueError(
+          f"Found sub-batch snapshots but no trainer checkpoint under {root}."
+          " Use a new checkpoint root or delete the sub_batch directory."
+      )
+
+    if state is None:
+      self._sub_batch.start_step(
+          self.rl_engine.global_steps, trainer.train_steps
+      )
+    else:
+      geometry = state.geometry
+      updates_per_epoch = geometry.full_batch_size // geometry.mini_batch_size
+      updates_per_step = geometry.num_iterations * updates_per_epoch
+      updates_done = trainer.train_steps - state.anchor_step
+      if updates_done > updates_per_step:
+        raise ValueError(
+            f"The sub-batch snapshot of global step {state.global_step} is"
+            f" older than trainer step {trainer.train_steps}. Delete the"
+            " sub_batch directory to resume from the trainer checkpoint."
+        )
+      if updates_done == updates_per_step:
+        # The step finished before the restart: start the next one.
+        self.rl_engine.global_steps = state.global_step + 1
+        self._sub_batch.start_step(
+            self.rl_engine.global_steps, trainer.train_steps
+        )
+      else:
+        trained_groups = (
+            min(updates_done, updates_per_epoch) * geometry.mini_batch_size
+        )
+        if len(state.active_groups) < trained_groups:
+          raise ValueError(
+              f"The sub-batch snapshot of global step {state.global_step}"
+              f" holds {len(state.active_groups)} groups, but the restored"
+              f" weights already trained on {trained_groups}."
+          )
+        self.rl_engine.global_steps = state.global_step
+        if geometry.num_iterations == 1:
+          # One epoch never revisits the groups the restored updates trained
+          # on: they are not re-queued.
+          state = dataclasses.replace(
+              state, active_groups=state.active_groups[trained_groups:]
+          )
+        elif self._packing_enabled:
+          # Replay epochs need every group: skip the trained updates' packs
+          # instead.
+          self._sb_skip_updates = updates_done
+        else:
+          # Replay epochs need every group: skip the trained chunks instead.
+          k = self._training_config.get_with_default(
+              "gradient_accumulation_steps", 1
+          )
+          self._sb_skip_chunks = updates_done * k
+        self._sb_resume = state
+    self.policy_version = self.rl_engine.global_steps
+
+  def _sb_start(self, anchor_step: int) -> None:
+    """Saves, pins and syncs the in-progress step's behavior policy."""
+    trainer = self.rl_engine.actor_trainer
+    if trainer.checkpoint_manager.latest_step() is None:
+      # Snapshots of the first step need its weights to resume from. The
+      # optimizer is not saved: a relaunch rebuilds its initial state.
+      trainer.checkpoint_manager.save(
+          0,
+          trainer.model,
+          save_only_lora_params=sft_utils.is_lora_enabled(trainer.model),
+          force=True,
+          custom_metadata={
+              "global_step": self.rl_engine.global_steps,
+              "role": rl_engine_lib.Role.ACTOR.value,
+          },
+      )
+      trainer.checkpoint_manager.wait()
+    elif self.should_sync_weights:
+      self._sb_sync_rollout_weights(anchor_step)
+    if self.should_sync_weights:
+      # Keeps the step's behavior policy checkpoint through retention.
+      trainer.checkpoint_manager.pin_step(anchor_step)
+
+  def _check_sub_batch_config(self) -> None:
+    """Rejects configurations that sub-batch checkpointing cannot resume."""
+    if not self._training_config.checkpoint_root_directory:
+      raise ValueError(
+          "sub_batch_checkpointing requires"
+          " training_config.checkpoint_root_directory."
+      )
+    if hasattr(self.rl_engine, "critic_trainer"):
+      raise ValueError("sub_batch_checkpointing does not support a critic.")
+    if self.algo_config.off_policy_steps:
+      raise ValueError("sub_batch_checkpointing requires off_policy_steps=0.")
+    if jax.process_count() > 1:
+      raise ValueError(
+          "sub_batch_checkpointing supports single-process runs only."
+      )
+    policy = checkpoint_options.resolve_checkpointing_defaults(
+        self._training_config.checkpointing_options
+    ).save_decision_policy
+    fixed_interval = ocp.training.save_decision_policies.FixedIntervalPolicy
+    if not (isinstance(policy, fixed_interval) and policy.interval == 1):
+      raise ValueError(
+          "sub_batch_checkpointing requires a trainer checkpoint at every"
+          f" optimizer update (FixedIntervalPolicy(1)), got {policy!r}."
+      )
+    if not self.should_sync_weights and (
+        not self.algo_config.use_rollout_logps
+        or self.algo_config.sampler_is == "token"
+        or self.algo_config.sampler_rs is not None
+        or self.algo_config.seq_logprob_error_threshold is not None
+    ):
+      raise ValueError(
+          "With colocated rollouts, sub_batch_checkpointing does not support"
+          " use_rollout_logps=False, sampler_is='token', sampler_rs or"
+          " seq_logprob_error_threshold: a restart cannot restore the step's"
+          " old-policy anchor."
+      )
+
+  def _sb_sync_rollout_weights(self, anchor_step: int) -> None:
+    """Pushes the in-progress step's behavior policy to the rollout engine."""
+    trainer = self.rl_engine.actor_trainer
+    if anchor_step == trainer.train_steps:
+      self.rl_engine.sync_weights(increment_global_steps=False)
+      return
+    if not trainer.checkpoint_manager.has_step(anchor_step):
+      raise RuntimeError(
+          f"Checkpoint {anchor_step}, the behavior policy of the in-progress"
+          " global step, is missing."
+      )
+    lora = sft_utils.is_lora_enabled(trainer.model)
+    params = trainer.checkpoint_manager.load_model_params(
+        anchor_step,
+        trainer.model,
+        restore_only_lora_params=lora,
+        memory_kind="pinned_host",
+    )
+    if lora:
+      # LoRA checkpoints hold only the adapters; the frozen base is live.
+      backbone = rl_utils.put_params_on_memory_kind(
+          nnx.state(trainer.model), "pinned_host"
+      )
+      params = nnx.merge_state(backbone, params)
+    self.rl_engine.sync_weights(params, increment_global_steps=False)
+
+  @staticmethod
+  def _sb_is_update_step(pack: TrainExample) -> bool:
+    """Whether training a packed example applies an optimizer update."""
+    return bool(np.asarray(pack.is_update_step).item())
+
+  def _sb_untrained(self, chunks: list[TrainExample]) -> list[TrainExample]:
+    """Drops the leading chunks whose updates the restored weights hold."""
+    if self._packing_enabled:
+      skipped = 0
+      while skipped < len(chunks) and self._sb_skip_updates:
+        if self._sb_is_update_step(chunks[skipped]):
+          self._sb_skip_updates -= 1
+        skipped += 1
+    else:
+      skipped = min(self._sb_skip_chunks, len(chunks))
+      self._sb_skip_chunks -= skipped
+    # Skipped chunks are not trained, so `_iter_steps` must not count them.
+    self._iter_steps -= skipped
+    return chunks[skipped:]
+
+  def _sb_ends_update(self, chunks: list[TrainExample]) -> bool:
+    """Whether training `chunks` applies an optimizer update."""
+    if self._packing_enabled:
+      return any(self._sb_is_update_step(chunk) for chunk in chunks)
+    k = self._training_config.get_with_default("gradient_accumulation_steps", 1)
+    return self.rl_engine.actor_trainer.iter_steps % k + len(chunks) >= k
+
+  def _sb_saved_rewards(
+      self,
+      items: list[agent_types.TrajectoryItem],
+      mode: rl_engine_lib.Mode,
+  ) -> np.ndarray | None:
+    """The rewards training `items` were scored with before a restart."""
+    if self._sub_batch is None or mode != rl_engine_lib.Mode.TRAIN:
+      return None
+    return self._sub_batch.restored_rewards(items)
+
   def _validate_rollout_config(self):
     """Validates that the rollout config is properly aligned with the algo config."""
     rollout_config = self.rl_engine.cluster_config.rollout_config
@@ -306,6 +530,8 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       completions: List[str],
       mode: rl_engine_lib.Mode,
       expected_step: int | None = None,
+      *,
+      trajectory_items: list[agent_types.TrajectoryItem],
       **kwargs,
   ) -> np.ndarray:
     """Computes the rewards for completions using the provided reward functions.
@@ -315,6 +541,7 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       completions: A list of generated text completions.
       mode: The mode to use for logging metrics.
       expected_step: The expected training step.
+      trajectory_items: The scored trajectories, in `prompts` order.
       **kwargs: Additional keyword arguments passed to the reward functions.
 
     Returns:
@@ -329,6 +556,10 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     """
     if "mode" in kwargs:
       raise ValueError(f"kwargs already contains mode as a key: {kwargs}")
+    saved = self._sb_saved_rewards(trajectory_items, mode)
+    if saved is not None:
+      # Restored rollouts reuse the rewards computed before the restart.
+      return saved
     kwargs["mode"] = str(mode)
 
     rewards_info = self.reward_manager(
@@ -346,6 +577,8 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     )
 
     rewards_array = np.asarray(rewards_info["rewards"])
+    if self._sub_batch is not None and mode == rl_engine_lib.Mode.TRAIN:
+      self._sub_batch.record_rewards(trajectory_items, rewards_array)
     with self._rewards_window_lock:
       target = (
           self._train_rewards_window
@@ -525,6 +758,8 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       prompt_iterator: Iterable[TrainingInputT] | AsyncIterator[TrainingInputT],
       num_generations: int = 1,
       collect_mode: str = "Token",
+      skip_group: Callable[[int], bool] | None = None,
+      first_group_id: int | None = None,
   ):
     """Generates trajectory groups using the orchestrator pattern.
 
@@ -533,6 +768,9 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       prompt_iterator: An iterable yielding single `TrainingInputT` examples.
       num_generations: The number of episodes to run per agent-environment pair.
       collect_mode: The mode for trajectory collection (e.g., "Token").
+      skip_group: Returns True for group ids that must not be generated.
+      first_group_id: The first prompt's group id. Defaults to the current
+        global step's first.
 
     Yields:
       A list of trajectories for a group.
@@ -541,11 +779,16 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
 
     async def pairs_stream_generator():
       """Yield (agent, env) pairs with unique group_id per original prompt."""
-      # TODO (tsbao): fix the group id when we can resume from mid global step
-      # with mini-batch.
-      group_id = self.rl_engine.global_steps * self._full_batch_size
+      group_id = (
+          self.rl_engine.global_steps * self._full_batch_size
+          if first_group_id is None
+          else first_group_id
+      )
       if is_async_iterator:
         async for single_example in prompt_iterator:  # pyrefly: ignore[not-iterable]
+          if skip_group is not None and skip_group(group_id):
+            group_id += 1
+            continue
           # Create agent-env pairs in parallel for a group to handle potential
           # cold start latency on env creation.
           agent_env_pairs = await asyncio.gather(*[
@@ -563,6 +806,9 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
           group_id += 1
       else:
         for single_example in prompt_iterator:  # pyrefly: ignore[not-iterable]
+          if skip_group is not None and skip_group(group_id):
+            group_id += 1
+            continue
           agent_env_pairs = await asyncio.gather(*[
               self.loop.run_in_executor(
                   None,
@@ -692,25 +938,33 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
           yield prompt
 
     prompt_iterator = _iterate_micro_batches()
+    # Read before restored groups let training advance `global_steps`.
+    first_group_id = (
+        None
+        if self._sub_batch is None
+        else self.rl_engine.global_steps * self._full_batch_size
+    )
     try:
+      if self._sb_resume is not None:
+        # Restored groups train first, in their original order.
+        for group in self._sb_resume.active_groups:
+          self._queue_train_group(group, train_data_queue)
       async for batch in self._orchestrator_producer(
           orchestrator=orchestrator,
           prompt_iterator=prompt_iterator,
           num_generations=self.algo_config.num_generations,
           collect_mode="Token",
+          skip_group=(
+              None
+              if self._sub_batch is None
+              else self._sub_batch.should_skip_group
+          ),
+          first_group_id=first_group_id,
       ):
         try:
-          if self._process_in_consumer:
-            # Put raw batch (list of trajectories) into queue.
-            # We put it once, and consumer will handle iterations.
-            train_data_queue.put(batch)
-          else:
-            train_examples = self._batch_to_train_example(
-                batch_results=batch,
-                mode=rl_engine_lib.Mode.TRAIN,
-            )
-            for train_example in train_examples:
-              train_data_queue.put(train_example)
+          if self._sub_batch is not None:
+            self._sub_batch.record_rollout_group(batch)
+          self._queue_train_group(batch, train_data_queue)
         except Exception as e:
           if not isinstance(e, RuntimeError):
             logging.exception(
@@ -723,6 +977,24 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       # Ensure that any background threads waiting on the prompt queue are
       # unblocked.
       prompt_queue.put(None)
+
+  def _queue_train_group(
+      self,
+      group: list[agent_types.TrajectoryItem],
+      train_data_queue: queue_lib.AbstractDataQueue,
+  ) -> None:
+    """Queues one generated group for training."""
+    if self._process_in_consumer:
+      # Put raw batch (list of trajectories) into queue.
+      # We put it once, and consumer will handle iterations.
+      train_data_queue.put(group)
+    else:
+      train_examples = self._batch_to_train_example(
+          batch_results=group,
+          mode=rl_engine_lib.Mode.TRAIN,
+      )
+      for train_example in train_examples:
+        train_data_queue.put(train_example)
 
   def _data_consumer_batch_generator(
       self, queue: queue_lib.AbstractDataQueue, batch_size: int
@@ -742,7 +1014,21 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       skip_jit: bool = False,
   ) -> None:
     """Main training loop for the AgenticRLLearner."""
+    try:
+      self._train_impl(train_dataset, eval_dataset, skip_jit)
+    finally:
+      if self._sub_batch is not None:
+        self._sub_batch.close()
+
+  def _train_impl(
+      self,
+      train_dataset: Iterable[TrainingInputT],
+      eval_dataset: Iterable[TrainingInputT] | None,
+      skip_jit: bool,
+  ) -> None:
+    """The body of `train`, which closes the sub-batch manager after it."""
     full_batch_iterator = iter(train_dataset)
+    self._init_sub_batch_checkpointing()
 
     if self.rl_engine.global_steps > 0:
       logging.info(
@@ -810,6 +1096,19 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
         (mini_batch_size, f"{mini_batch_size=}"),
     ]:
       rl_utils.check_divisibility(v, full_batch_size, n, f"{full_batch_size=}")
+
+    if self._sub_batch is not None:
+      self._sub_batch.set_geometry(
+          sub_batch_checkpoint.BatchGeometry(
+              full_batch_size=full_batch_size,
+              mini_batch_size=mini_batch_size,
+              train_micro_batch_size=train_micro_batch_size,
+              gradient_accumulation_steps=grad_acc_steps,
+              num_generations=self._num_generations(),
+              num_iterations=self._num_iterations(),
+          )
+      )
+      self._sb_start(self._sub_batch.anchor_step)
 
     logging.info(  # pylint: disable=logging-fstring-interpolation
         f"Training with {full_batch_size=}, {mini_batch_size=},"
@@ -900,6 +1199,11 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     unpacked_micro_step_counter = 0
     did_eval_this_global_step = False
     full_batch_chunks = []
+    if self._sb_resume is not None and self._num_iterations() == 1:
+      # The step's restored updates; their groups were not re-queued.
+      update_steps_since_last_sync = (
+          self.rl_engine.actor_trainer.train_steps - self._sb_resume.anchor_step
+      )
     for train_micro_batch in train_data_gen:
       if (
           self._training_config.max_steps
@@ -1009,6 +1313,8 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
             all_eval_prompts
             and current_train_step % training_config.eval_every_n_steps == 0
             and current_train_step != self._last_eval_train_step
+            # A resumed step does not repeat its eval.
+            and self._sb_resume is None
         ):
           self._last_eval_train_step = current_train_step
           self._eval_iter_steps = 0
@@ -1041,13 +1347,16 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       # microbatches, and #iterations=K, we will:
       #   1. Train on the m * n microbatches once as we get them from rollout.
       #   2. When we get the full batch, repeat K-1 times on the entire batch.
-      self.rl_engine.update_actor(
-          chunked_train_micro_batch, current_eval_dataset, skip_jit
-      )
-      if hasattr(self.rl_engine, "critic_trainer"):
-        self.rl_engine.update_critic(
-            chunked_train_micro_batch, current_eval_dataset, skip_jit
-        )
+      chunks = chunked_train_micro_batch
+      if self._sub_batch is not None:
+        chunks = self._sb_untrained(chunks)
+        if chunks:
+          # The rollouts an update trains on are durable before the update.
+          self._sub_batch.snapshot(wait=self._sb_ends_update(chunks))
+      if chunks:
+        self.rl_engine.update_actor(chunks, current_eval_dataset, skip_jit)
+        if hasattr(self.rl_engine, "critic_trainer"):
+          self.rl_engine.update_critic(chunks, current_eval_dataset, skip_jit)
 
       # --- Weight Sync Logic ---
       if is_packed:
@@ -1076,10 +1385,25 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
 
           # TODO(yixuanm): Eval during iteration too. Skipping for now as we
           # will refactor the learner soon.
-          self.rl_engine.update_actor(full_batch_chunks, None, skip_jit)
-          if hasattr(self.rl_engine, "critic_trainer"):
-            self.rl_engine.update_critic(full_batch_chunks, None, skip_jit)
+          chunks = full_batch_chunks
+          if self._sub_batch is not None:
+            chunks = self._sb_untrained(chunks)
+          if chunks:
+            self.rl_engine.update_actor(chunks, None, skip_jit)
+            if hasattr(self.rl_engine, "critic_trainer"):
+              self.rl_engine.update_critic(chunks, None, skip_jit)
         full_batch_chunks.clear()
+        if self._sub_batch is not None:
+          # The next step's behavior policy is the current weights.
+          anchor_step = self.rl_engine.actor_trainer.train_steps
+          self._sb_resume = None
+          self._sub_batch.start_step(
+              self.rl_engine.global_steps + 1, anchor_step
+          )
+          if self.should_sync_weights:
+            self.rl_engine.actor_trainer.checkpoint_manager.pin_step(
+                anchor_step
+            )
 
         global_step_time = time.time() - self._global_step_start_time
         logging.info(

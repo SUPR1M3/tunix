@@ -265,6 +265,8 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         self.rl_engine = mock.Mock()
         self.metric_fns = []
         self._process_in_consumer = False
+        self._sub_batch = None
+        self._sb_resume = None
 
       def _create_micro_batch_iterator(self, iterator, batch_size):
         # The dataset batch size is 2, and we want to test micro-batching
@@ -294,6 +296,8 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
           ),
           num_generations: int = 1,
           collect_mode: str = "Token",
+          skip_group=None,
+          first_group_id=None,
       ):
         i = 0
         if hasattr(prompt_iterator, "__aiter__"):
@@ -2521,7 +2525,16 @@ class ExactTokenContinuityBatchTest(absltest.TestCase):
         "original_input": {"prompts": ["fixture"]},
     }
 
-  def _make_batch(self, *, exact=True, packed=False, raw=None):
+  def _make_batch(
+      self,
+      *,
+      exact=True,
+      packed=False,
+      raw=None,
+      sub_batch=None,
+      trajectory_logger=None,
+      metric_fns=(),
+  ):
     import copy  # pylint: disable=g-import-not-at-top
     from tunix.perf.experimental import tracer  # pylint: disable=g-import-not-at-top
     from tunix.rl.agentic.agents import agent_types  # pylint: disable=g-import-not-at-top
@@ -2533,9 +2546,10 @@ class ExactTokenContinuityBatchTest(absltest.TestCase):
         beta=0.0,
         use_rollout_logps=True,
     )
-    obj._trajectory_logger = None
+    obj._sub_batch = sub_batch
+    obj._trajectory_logger = trajectory_logger
     obj._full_batch_size = 0
-    obj.metric_fns = []
+    obj.metric_fns = list(metric_fns)
     obj._compute_rewards = lambda **kw: jnp.array([0.0, 1.0])
     obj.rl_engine = types.SimpleNamespace(
         rollout=types.SimpleNamespace(pad_id=lambda: 0, eos_id=lambda: 255),
@@ -2556,6 +2570,21 @@ class ExactTokenContinuityBatchTest(absltest.TestCase):
         agent_types.TrajectoryItem(traj=copy.deepcopy(record)) for _ in range(2)
     ]
     return obj._process_results(items)[0]
+
+  def test_rollouts_scored_before_a_restart_are_not_logged_or_measured(self):
+    for saved_rewards, calls in ((None, 1), (np.array([0.0, 1.0]), 0)):
+      with self.subTest(restored=saved_rewards is not None):
+        logger = mock.Mock()
+        metric_fn = mock.Mock(return_value={})
+        self._make_batch(
+            sub_batch=mock.Mock(
+                restored_rewards=mock.Mock(return_value=saved_rewards)
+            ),
+            trajectory_logger=logger,
+            metric_fns=[metric_fn],
+        )
+        self.assertEqual(logger.log_item_async.call_count, 2 * calls)
+        self.assertEqual(metric_fn.call_count, calls)
 
   def test_exact_batch_keeps_recorded_ids_masks_and_logprobs(self):
     raw = self._raw_trajectory()

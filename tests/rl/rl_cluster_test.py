@@ -307,6 +307,7 @@ class RlEngineTest(parameterized.TestCase):
       self,
       rollout_engine: str,
       rollout_config: base_rollout.RolloutConfig,
+      colocated: bool = False,
   ) -> rl_engine_lib.RLEngine:
     split_index = self.device_count // 2
     actor_mesh = Mesh(
@@ -317,6 +318,8 @@ class RlEngineTest(parameterized.TestCase):
         np.array(jax.devices()[split_index:]).reshape(1, split_index),
         ('fsdp', 'tp'),
     )
+    if colocated:
+      rollout_mesh = actor_mesh
     cluster_config = rl_engine_lib.ClusterConfig(
         role_to_mesh={
             rl_engine_lib.Role.ACTOR: actor_mesh,
@@ -383,6 +386,40 @@ class RlEngineTest(parameterized.TestCase):
     with mock.patch.object(rl_engine_lib.gc, 'collect') as mock_collect:
       rl_engine.sync_weights()
     self.assertEqual(mock_collect.called, gc_collect_after_weight_sync)
+
+  def test_sync_weights_pushes_given_params_without_ending_the_step(self):
+    # One mesh: on CPU, sync_weights' transfer guard rejects cross-mesh copies.
+    rl_engine = self._create_test_rl_engine(
+        'vanilla',
+        base_rollout.RolloutConfig(
+            max_tokens_to_generate=10, max_prompt_length=256, kv_cache_size=1024
+        ),
+        colocated=True,
+    )
+    actor_state = nnx.state(rl_engine.actor_trainer.model)
+    live = jax.tree.map(np.asarray, actor_state)
+    params = jax.tree.map(lambda x: x + 1.0, actor_state)
+
+    rl_engine.sync_weights(params, increment_global_steps=False)
+
+    self.assertEqual(rl_engine.global_steps, 0)
+    jax.tree.map_with_path(
+        tc.assert_close, params, nnx.state(rl_engine.rollout.model())
+    )
+    # The pushed params are also the anchor policy, on host memory.
+    anchor = rl_engine._anchor_policy_state
+    jax.tree.map_with_path(tc.assert_close, params, anchor)
+    self.assertTrue(
+        all(
+            leaf.sharding.memory_kind == 'pinned_host'
+            for leaf in jax.tree.leaves(anchor)
+        )
+    )
+    jax.tree.map_with_path(
+        tc.assert_close, live, nnx.state(rl_engine.actor_trainer.model)
+    )
+    rl_engine.sync_weights()
+    self.assertEqual(rl_engine.global_steps, 1)
 
   def test_init_engine_invalid_engine_string(self):
     with self.assertRaisesRegex(

@@ -1302,8 +1302,19 @@ class RLEngine:
         )
       return actor_per_token_logps
 
-  def sync_weights(self):
-    """Syncs the weights of between the sampler model and trainer model."""
+  def sync_weights(
+      self,
+      params: jaxtyping.PyTree | None = None,
+      *,
+      increment_global_steps: bool = True,
+  ):
+    """Pushes the actor's weights to the rollout model.
+
+    Args:
+      params: Weights to push instead of the actor's; they also become the
+        anchor policy. Must not alias the live actor variables.
+      increment_global_steps: Whether this sync ends a global step.
+    """
     if jax.devices() and jax.default_backend() not in ["tpu", "gpu"]:
       cm = contextlib.ExitStack()
       cm.enter_context(jax.transfer_guard_device_to_host("disallow_explicit"))
@@ -1316,17 +1327,23 @@ class RLEngine:
           if sft_utils.is_lora_enabled(self.actor_trainer.model)
           else nnx.Param,
       )
-      src_filtered_params = nnx.state(self.actor_trainer.model, filter_types)
+      if params is None:
+        src_filtered_params = nnx.state(self.actor_trainer.model, filter_types)
+        params = nnx.state(self.actor_trainer.model)
+      else:
+        src_filtered_params = statelib.filter_state(params, filter_types)
       self.rollout.update_params(src_filtered_params, filter_types)
       if self.cluster_config.gc_collect_after_weight_sync:
         gc.collect()
-      # The anchor policy state is snapshotted from actor_trainer.model.
+      # The anchor policy state is snapshotted from the synced weights.
       self._anchor_policy_state = rl_utils.put_params_on_memory_kind(
-          nnx.state(self.actor_trainer.model), "pinned_host"
+          params, "pinned_host"
       )
 
-    # sync weights marks the end of a full batch, so increment the global steps.
-    self.global_steps += 1
+    if increment_global_steps:
+      # sync weights marks the end of a full batch, so increment the global
+      # steps.
+      self.global_steps += 1
 
   def get_values(
       self,

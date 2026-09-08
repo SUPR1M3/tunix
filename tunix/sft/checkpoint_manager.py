@@ -15,6 +15,7 @@
 """Checkpoint manager for PEFT."""
 
 from collections.abc import Mapping
+import dataclasses
 import functools
 import os
 import time
@@ -121,6 +122,17 @@ def _fix_sharding(state: Any) -> Any:
   )
 
 
+@dataclasses.dataclass
+class _PinnedStep(ocp.training.preservation_policies.PreservationPolicy):
+  """Preserves one step on top of the retention policy; None pins nothing."""
+
+  step: int | None = None
+
+  def should_preserve(self, checkpoints, *, context):
+    del context
+    return [ck.step == self.step for ck in checkpoints]
+
+
 class CheckpointManager:
   """Checkpoint manager for PEFT."""
 
@@ -140,12 +152,18 @@ class CheckpointManager:
     self._options = checkpoint_options.resolve_checkpointing_defaults(
         options
     )
+    self._pin = _PinnedStep()
     if root_directory:
+      preservation_policy = (
+          ocp.training.preservation_policies.AnyPreservationPolicy(
+              [self._options.preservation_policy, self._pin]  # pyrefly: ignore[bad-argument-type]
+          )
+      )
       self._checkpointer = ocp.training.Checkpointer(
           root_directory,
           context=self._context,
           save_decision_policy=self._options.save_decision_policy,  # pyrefly: ignore[bad-argument-type]
-          preservation_policy=self._options.preservation_policy,  # pyrefly: ignore[bad-argument-type]
+          preservation_policy=preservation_policy,  # pyrefly: ignore[bad-argument-type]
           step_name_format=self._options.step_name_format,
       )
 
@@ -217,6 +235,28 @@ class CheckpointManager:
       return None
     return self._checkpointer.latest.step
 
+  def has_step(self, step: int) -> bool:
+    """Whether a checkpoint for `step` is on disk."""
+    return self._checkpointer is not None and any(
+        ck.step == step for ck in self._checkpointer.checkpoints
+    )
+
+  def pin_step(self, step: int | None) -> None:
+    """Keeps checkpoint `step` regardless of the retention policy.
+
+    Takes effect at the next save, which may then delete the previously pinned
+    step. None unpins.
+
+    Args:
+      step: The step to keep.
+    """
+    self._pin.step = step
+
+  def wait(self) -> None:
+    """Blocks until pending saves are durable."""
+    if self._checkpointer is not None:
+      self._checkpointer.wait()
+
   def save(
       self,
       step: int,
@@ -266,6 +306,67 @@ class CheckpointManager:
         step, checkpointables, force, custom_metadata
     )
 
+  def _model_params_target(
+      self, model: nnx.Module, restore_only_lora_params: bool
+  ) -> tuple[nnx.State, ocp.Context]:
+    """The params state to load into and the context to load it with."""
+    if not restore_only_lora_params:
+      return nnx.state(model), self._context
+    # Partial (LoRA) restore is the one path that overrides the persistent
+    # context to enable partial loading.
+    load_ctx = ocp.Context(self._context)
+    load_ctx.pytree.loading.partial_load = True
+    return nnx.state(model, nnx.LoRAParam), load_ctx
+
+  def load_model_params(
+      self,
+      step: int,
+      model: nnx.Module,
+      *,
+      restore_only_lora_params: bool = False,
+      memory_kind: str | None = None,
+  ) -> nnx.State:
+    """Loads checkpoint `step`'s model params into a new tree.
+
+    Unlike `maybe_restore`, `model` is left unchanged: it only supplies the
+    params' structure, shapes, dtypes and shardings.
+
+    Args:
+      step: The checkpoint step to load.
+      model: The model whose params layout to load into.
+      restore_only_lora_params: Whether to load only the LoRA params.
+      memory_kind: If set (e.g. "pinned_host"), the memory kind to place the
+        loaded arrays on.
+
+    Returns:
+      The loaded params, shaped like `nnx.state(model)` (only its LoRA params
+      when `restore_only_lora_params`).
+
+    Raises:
+      ValueError: If the manager has no checkpoint directory.
+    """
+    if self._checkpointer is None:
+      raise ValueError('load_model_params needs a checkpoint directory.')
+    target, load_ctx = self._model_params_target(
+        model, restore_only_lora_params
+    )
+    abstract = jax.tree.map(
+        lambda x: jax.ShapeDtypeStruct(
+            x.shape,
+            x.dtype,
+            sharding=(
+                x.sharding.with_memory_kind(memory_kind)
+                if memory_kind
+                else x.sharding
+            ),
+        ),
+        target,
+    )
+    with load_ctx:
+      return self._checkpointer.load_checkpointables(
+          step, {'model_params': abstract}
+      )['model_params']
+
   def maybe_restore(
       self,
       model: nnx.Module,
@@ -302,15 +403,9 @@ class CheckpointManager:
 
     metadata = self._checkpointer.checkpointables_metadata(step)
 
-    if restore_only_lora_params:
-      model_params_state = nnx.state(model, nnx.LoRAParam)
-      # Partial (LoRA) restore is the one path that overrides the persistent
-      # context to enable partial loading.
-      load_ctx = ocp.Context(self._context)
-      load_ctx.pytree.loading.partial_load = True
-    else:
-      model_params_state = nnx.state(model)
-      load_ctx = self._context
+    model_params_state, load_ctx = self._model_params_target(
+        model, restore_only_lora_params
+    )
     abstract_checkpointables = {'model_params': model_params_state}
 
     if (
