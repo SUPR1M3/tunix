@@ -43,6 +43,8 @@ from tunix.dist_rl.orchestrator import step_telemetry
 from tunix.dist_rl.queue_manager import trajectory_queue_manager
 from tunix.dist_rl.trajectory import store as trajectory_store_lib
 from tunix.rl import common as rl_common
+from tunix.rl import function_registry
+from tunix.rl import reward_manager as reward_manager_lib
 from tunix.sft import metrics_logger as metrics_logger_lib
 from tunix.utils import trajectory_logger
 
@@ -55,6 +57,13 @@ GroupOrder = trajectory_queue_manager.GroupOrder
 TrajectoryQueueManager = trajectory_queue_manager.TrajectoryQueueManager
 FifoGroupQueue = trajectory_queue_manager.FifoGroupQueue
 BatchOrderedGroupQueue = trajectory_queue_manager.BatchOrderedGroupQueue
+
+# Reward manager `log_metrics` entries: metric name -> (value, aggregation
+# function), where each value is a per-call scalar or per-trajectory array.
+RewardLogMetricAggFn = Callable[[np.ndarray], float | np.number]
+RewardLogMetrics = Mapping[
+    str, tuple[np.ndarray | float | np.number, RewardLogMetricAggFn]
+]
 
 
 def _next_microbatch(
@@ -122,9 +131,7 @@ def _generation_metrics(
     return {}
   return {
       "rollout/completions/clip_ratio": float(np.mean(clip_ratios)),
-      "rollout/completions/mean_raw_length": float(
-          np.mean(group_mean_lengths)
-      ),
+      "rollout/completions/mean_raw_length": float(np.mean(group_mean_lengths)),
       "rollout/completions/max_raw_length": float(np.max(all_lengths)),
       "rollout/completions/min_raw_length": float(np.min(all_lengths)),
   }
@@ -132,6 +139,22 @@ def _generation_metrics(
 
 # Rollouts named per step in the `[rollout] ... slowest` log line.
 _NUM_SLOWEST_ROLLOUTS_LOGGED = 3
+
+# Trajectory metadata that `_score_group` does not forward to reward functions:
+# keys it already passes explicitly, plus orchestration plumbing that the engine
+# and rollout workers attach to every trajectory (lineage telemetry, environment
+# construction config, MoE routing replay arrays, and the group size, which
+# reward functions can read from `algo_config.num_generations`).
+_NON_REWARD_METADATA_KEYS: frozenset[str] = frozenset({
+    "prompts",
+    "completions",
+    "trajectory_rewards",
+    "mode",
+    "lineage",
+    "env_config",
+    "routed_experts",
+    "num_generations",
+})
 
 
 def _extract_reward(item: Any) -> float:
@@ -166,20 +189,6 @@ def _extract_reward(item: Any) -> float:
         " stamp the trajectory reward under 'trajectory_reward'."
     )
   return float(traj["trajectory_reward"])
-
-
-def _invoke_reward_fn(
-    fn: Callable[[str, Mapping[str, Any]], float],
-    item: datatypes.TrajectoryItem,
-) -> float:
-  """Scores `item`'s assistant completion string with `fn(completion, metadata)`."""
-  if not isinstance(item.traj, dict):
-    raise TypeError(
-        "Expected a Token-mode trajectory mapping, got"
-        f" {type(item.traj).__name__}."
-    )
-  completion = datatypes.assistant_text(item.traj.get("conversation_text", ""))
-  return float(fn(completion, item.metadata))
 
 
 def _format_rollout_completion(conversation: Any) -> str:
@@ -243,11 +252,14 @@ class ScoredGroup:
       `routed_experts` stripped (`len == G`).
     rewards: Scalar rewards computed by `critique_stage` (`len == G`), also
       stamped into each `item.traj["trajectory_reward"]` for downstream logging.
+    reward_log_metrics: Per-group reward manager log metrics (`name -> (values,
+      agg_fn)`) to be aggregated across the step in `train_stage`.
   """
 
   payloads: tuple[datatypes.RLTrainerPayload, ...]
   items: tuple[datatypes.TrajectoryItem, ...]
   rewards: tuple[float, ...]
+  reward_log_metrics: RewardLogMetrics = dataclasses.field(default_factory=dict)
 
   def __post_init__(self) -> None:
     if not (len(self.payloads) == len(self.items) == len(self.rewards)):
@@ -329,7 +341,11 @@ class StandardRLProgram(RLProgram):
       algo: algorithm_adapter.AlgorithmAdapter,
       dataset: Iterable[Any] | None = None,
       max_steps: int | None = None,
-      reward_fns: Sequence[Callable[..., Any]] | None = None,
+      reward_fns: (
+          reward_manager_lib.RewardFn
+          | Sequence[reward_manager_lib.RewardFn]
+          | None
+      ) = None,
       assembler: batch_assembly.BatchAssembler | None = None,
       batch_config: batch_assembly.BatchConfig | None = None,
       generation_args: datatypes.GenerationArgs | None = None,
@@ -391,7 +407,15 @@ class StandardRLProgram(RLProgram):
         else None
     )
 
-    self.reward_fns = list(reward_fns) if reward_fns else []
+    reward_manager_fn = function_registry.get_reward_manager(
+        self.algo.algo_config.reward_mode
+    )
+    self.reward_manager: reward_manager_lib.AbstractRewardManager = (
+        reward_manager_fn(
+            reward_fns=reward_fns,
+            algo_config=self.algo.algo_config,
+        )
+    )
     self.num_generations = algo.num_generations
     self.mini_batch_size = algo.mini_batch_size
     if self.mini_batch_size <= 0 or self.num_generations <= 0:
@@ -512,16 +536,19 @@ class StandardRLProgram(RLProgram):
     return self._trajectory_store
 
   def close(self) -> None:
-    """Flushes and closes the metrics logger and associated resources.
+    """Flushes and closes loggers, the reward manager, and program resources.
 
     Does not close `self._trajectory_store`: this program does not own it
     (see `__init__`), and closing a store the orchestrator may still be
     using — e.g. across a second `run_program()` call — would be wrong.
     """
-    if self.trajectory_logger is not None:
-      self.trajectory_logger.stop()
-    if self.metrics_logger is not None:
-      self.metrics_logger.close()
+    try:
+      if self.trajectory_logger is not None:
+        self.trajectory_logger.stop()
+      if self.metrics_logger is not None:
+        self.metrics_logger.close()
+    finally:
+      self.reward_manager.close()
 
   async def _resume_from_checkpoint(self) -> None:
     """Realigns program orchestration state with the engine's restored checkpoint.
@@ -660,6 +687,78 @@ class StandardRLProgram(RLProgram):
       # NB: We currently assume it's safe to silently drop partial groups upon EOF.
       await self.raw_q.close()
 
+  def _score_group(
+      self,
+      group: Sequence[datatypes.TrajectoryItem],
+  ) -> tuple[list[float], RewardLogMetrics]:
+    """Scores a trajectory group via `self.reward_manager`.
+
+    Skips reward evaluation or extraction for failed, timed-out, or masked-out
+    trajectories (`not item.is_valid`), assigning them `0.0`: although their
+    payloads still go through trainer fwd/bwd to keep static batch shapes, their
+    advantage and completion_mask are zeroed out, so scoring them is wasted work
+    (and an aborted trajectory may lack a user turn or `trajectory_reward`).
+
+    Forwards prompt text (`datatypes.prompt_text(conversation_text)`), assistant
+    completions (`datatypes.assistant_text(conversation_text)`), environment
+    `trajectory_rewards`, and the non-plumbing `metadata` fields shared by all
+    valid items to `self.reward_manager`. Also returns the reward manager's
+    `log_metrics` entries that carry an aggregation function, which
+    `_collect_and_log_step_metrics` reduces once per training step.
+
+    Args:
+      group: Sequence of `TrajectoryItem`s in the group.
+
+    Returns:
+      A `(rewards, log_metrics)` tuple aligned with `group` (`0.0` for invalid
+      items).
+
+    Raises:
+      KeyError: If any valid item's `traj` is missing `"conversation_text"` or
+        `"trajectory_reward"`.
+      TypeError: If `conversation_text` or `traj` does not match the Token-mode
+        schema.
+      ValueError: If `conversation_text` contains no `"user"` message.
+    """
+    valid_items = [item for item in group if item.is_valid]
+    if not valid_items:
+      return [0.0] * len(group), {}
+    prompts = [
+        datatypes.prompt_text(item.traj["conversation_text"])
+        for item in valid_items
+    ]
+    completions = [
+        datatypes.assistant_text(item.traj["conversation_text"])
+        for item in valid_items
+    ]
+    trajectory_rewards = [_extract_reward(item) for item in valid_items]
+    metadata_keys = [
+        k
+        for k in valid_items[0].metadata
+        if k not in _NON_REWARD_METADATA_KEYS
+        and all(k in item.metadata for item in valid_items)
+    ]
+    reward_kwargs: dict[str, list[Any]] = {
+        k: [item.metadata[k] for item in valid_items] for k in metadata_keys
+    }
+    rewards_info = self.reward_manager(
+        prompts=prompts,
+        completions=completions,
+        trajectory_rewards=trajectory_rewards,
+        mode=str(self.mode),
+        **reward_kwargs,
+    )
+    log_metrics: RewardLogMetrics = {
+        name: (value, agg_fn)
+        for name, (value, agg_fn) in rewards_info["log_metrics"].items()
+        if agg_fn is not None
+    }
+    valid_rewards = iter(rewards_info["rewards"])
+    rewards = [
+        float(next(valid_rewards)) if item.is_valid else 0.0 for item in group
+    ]
+    return rewards, log_metrics
+
   async def critique_stage(self) -> None:
     """Stage 2: Scores rewards, PRMs, and reference KL logprobs."""
     assert self.engine is not None
@@ -678,21 +777,9 @@ class StandardRLProgram(RLProgram):
               f" num_generations={self.num_generations}."
           )
 
-        rewards = []
-        for item in group:
-          # Skip reward evaluation or extraction for failed, timed-out, or
-          # masked-out trajectories (`not item.is_valid`): although the payload
-          # still goes through trainer fwd/bwd to keep static batch shapes, its
-          # advantage and completion_mask are zeroed out, so scoring it is
-          # wasted work (and an aborted trajectory may lack trajectory_reward).
-          if not item.is_valid:
-            r = 0.0
-          elif self.reward_fns:
-            r = sum(_invoke_reward_fn(fn, item) for fn in self.reward_fns)
-          else:
-            r = _extract_reward(item)
-          rewards.append(float(r))
-          del item
+        rewards, group_reward_log_metrics = await asyncio.to_thread(
+            self._score_group, group
+        )
 
         raw_payloads = self.algo.create_trainer_payloads(group, rewards=rewards)
         if len(raw_payloads) != len(group):
@@ -776,8 +863,10 @@ class StandardRLProgram(RLProgram):
             payloads=tuple(group_payloads),
             items=tuple(group_items),
             rewards=tuple(rewards),
+            reward_log_metrics=group_reward_log_metrics,
         )
         del group_payloads, group_items, trainer_payloads
+        del group_reward_log_metrics
         await self.scored_q.put(scored_group)
         del scored_group
         if group:
@@ -814,9 +903,7 @@ class StandardRLProgram(RLProgram):
         prefix = "global"
     if self.metrics_prefix:
       prefix = (
-          f"{self.metrics_prefix}/{prefix}"
-          if prefix
-          else self.metrics_prefix
+          f"{self.metrics_prefix}/{prefix}" if prefix else self.metrics_prefix
       )
     self.metrics_logger.log(prefix, metric_name, scalar_value, self.mode, step)
 
@@ -847,6 +934,7 @@ class StandardRLProgram(RLProgram):
       sampler_agreement: dict[str, tuple[Any, list[Any]]] | None = None,
       filtered_groups: Sequence[Sequence[datatypes.TrajectoryItem]] = (),
       step_times: step_telemetry.StepTimes | None = None,
+      reward_log_metrics: Sequence[RewardLogMetrics] = (),
   ) -> dict[str, Any]:
     """Logs rollout, reward, trainer, and orchestrator metrics.
 
@@ -982,16 +1070,34 @@ class StandardRLProgram(RLProgram):
     reward_min = float(np.min(rewards_to_log)) if rewards_to_log else 0.0
     reward_max = float(np.max(rewards_to_log)) if rewards_to_log else 0.0
     reward_sum = float(np.sum(rewards_to_log)) if rewards_to_log else 0.0
+    # Reduce each reward manager metric over all of the step's groups with its
+    # own aggregation function, the same way `MetricsBuffer` reduces per-call
+    # values in the RL learners: per-group scalars such as
+    # `trajectory_rewards/mean` are reduced across groups, and per-trajectory
+    # arrays such as `rewards/<reward_fn>` across all trajectories.
+    reward_metrics_accum: dict[
+        str, tuple[RewardLogMetricAggFn, list[np.ndarray]]
+    ] = {}
+    for group_reward_metrics in reward_log_metrics:
+      for name, (value, agg_fn) in group_reward_metrics.items():
+        if name not in reward_metrics_accum:
+          reward_metrics_accum[name] = (agg_fn, [])
+        reward_metrics_accum[name][1].append(np.atleast_1d(value))
+    step_reward_metrics: dict[str, float] = {
+        name: float(agg_fn(np.concatenate(values)))
+        for name, (agg_fn, values) in reward_metrics_accum.items()
+        if values
+    }
     if rewards_to_log:
-      reward_stats = {
-          "mean": reward_mean,
-          "std": reward_std,
-          "min": reward_min,
-          "max": reward_max,
-          "sum": reward_sum,
-      }
-      for tag, val in reward_stats.items():
-        self._log_metric(f"rewards/{tag}", val, log_step)
+      step_reward_metrics.update({
+          "rewards/mean": reward_mean,
+          "rewards/std": reward_std,
+          "rewards/min": reward_min,
+          "rewards/max": reward_max,
+          "rewards/sum": reward_sum,
+      })
+    for name, val in step_reward_metrics.items():
+      self._log_metric(name, val, log_step)
 
     # --- Advantage Metrics ---
     advantage_mean = float(np.mean(step_advantages)) if step_advantages else 0.0
@@ -1092,9 +1198,7 @@ class StandardRLProgram(RLProgram):
       if loss_val is not None:
         self._log_metric("loss", loss_val, log_step, prefix="actor")
         perplexity_val = float(np.exp(loss_val))
-        self._log_metric(
-            "perplexity", perplexity_val, log_step, prefix="actor"
-        )
+        self._log_metric("perplexity", perplexity_val, log_step, prefix="actor")
 
       # Learning Rate
       raw_lr = scalar_metrics.pop(
@@ -1123,9 +1227,7 @@ class StandardRLProgram(RLProgram):
       for k, v in weighted_metrics.items():
         val = _extract_scalar(v)
         if val is not None:
-          clean_key = (
-              k.removeprefix("trainer/").removeprefix("actor/")
-          )
+          clean_key = k.removeprefix("trainer/").removeprefix("actor/")
           self._log_metric(clean_key, val, log_step, prefix="actor")
 
       # Auxiliary scalar metrics
@@ -1134,9 +1236,7 @@ class StandardRLProgram(RLProgram):
           continue
         val = _extract_scalar(v)
         if val is not None:
-          clean_key = (
-              k.removeprefix("trainer/").removeprefix("actor/")
-          )
+          clean_key = k.removeprefix("trainer/").removeprefix("actor/")
           if clean_key.startswith((
               "sampler_trainer/",
               "sampler_is/",
@@ -1332,6 +1432,7 @@ class StandardRLProgram(RLProgram):
         consumed_policy_version = self.policy_version
 
         uncommitted_groups: list[list[datatypes.TrajectoryItem]] = []
+        step_reward_log_metrics: list[RewardLogMetrics] = []
         step_result = None
         trainer_metrics = None
         step_sampler_agreement: dict[str, tuple[Any, list[Any]]] = {}
@@ -1387,6 +1488,8 @@ class StandardRLProgram(RLProgram):
 
             groups_consumed += 1
             group_items = list(scored_group.items)
+            if scored_group.reward_log_metrics:
+              step_reward_log_metrics.append(scored_group.reward_log_metrics)
             payloads: list[datatypes.RLTrainerPayload] = []
             for item, payload, reward_val in zip(
                 scored_group.items,
@@ -1585,6 +1688,7 @@ class StandardRLProgram(RLProgram):
             sampler_agreement=step_sampler_agreement,
             filtered_groups=filtered_groups,
             step_times=step_times,
+            reward_log_metrics=step_reward_log_metrics,
         )
         del filtered_groups
         self._log_consumed_trajectories(
@@ -1652,9 +1756,7 @@ class StandardRLProgram(RLProgram):
         assembler=self.assembler,
         can_fuse_agreement_in_loss=self.can_fuse_agreement_in_loss,
         precompile=self.precompile_trainer,
-        return_routed_experts=bool(
-            self.generation_args.return_routed_experts
-        ),
+        return_routed_experts=bool(self.generation_args.return_routed_experts),
     )
 
     if self.sync_weights:
