@@ -230,11 +230,8 @@ class FaultToleranceConfig:
       worker, and an evicted worker whose process is still alive never
       re-registers (rollout workers register with discovery only once at
       startup), so a transient fault on a healthy worker permanently shrinks the
-      rollout pool. Until dynamic worker rejoin lands, an evicted worker's id is
-      also rejected if it tries to re-register
-      (`WorkerRegistry.unregister_handle`), so a restarted worker never receives
-      tasks without bring-up and weight sync. When `False`, fault tolerance is
-      disabled and `effective_max_task_retries` is `0`.
+      rollout pool. When `False`, fault tolerance is disabled and
+      `effective_max_task_retries` is `0`.
     max_task_retries: Maximum number of times an in-flight task is re-dispatched
       onto surviving workers after a worker failure when `enabled=True`. Because
       each send-path or poll-path transport failure evicts the failing worker in

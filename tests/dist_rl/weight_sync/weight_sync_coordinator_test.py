@@ -424,10 +424,16 @@ class CoordinatorTestBase(absltest.TestCase):
         s._log = self.log  # pylint: disable=protected-access
     self.sources = sources
     for source in sources:
-      self.registry.register(source)
+      info = self.registry.register(source)
+      self.registry.set_status(
+          info.worker_id, worker_registry.AdmissionStatus.ACTIVE
+      )
     for destination in destinations:
       destination._log = self.log  # pylint: disable=protected-access
-      self.registry.register(destination)
+      info = self.registry.register(destination)
+      self.registry.set_status(
+          info.worker_id, worker_registry.AdmissionStatus.ACTIVE
+      )
     self.coordinator = weight_sync_coordinator.WeightSyncCoordinator(
         registry=self.registry,
         handler=self.handler,
@@ -1010,6 +1016,8 @@ class ProtocolRejectionTest(CoordinatorTestBase):
     registry = worker_registry.WorkerRegistry()
     registry.register(Bare())
     registry.register(dest)
+    for wid in registry.worker_ids():
+      registry.set_status(wid, worker_registry.AdmissionStatus.ACTIVE)
     coordinator = weight_sync_coordinator.WeightSyncCoordinator(
         registry=registry, handler=FakeHandler(Wire(), []),
         timeouts=FAST_TIMEOUTS,
@@ -1036,6 +1044,8 @@ class ProtocolRejectionTest(CoordinatorTestBase):
     registry = worker_registry.WorkerRegistry()
     registry.register(FakeSource("trainer", wire, []))
     registry.register(MetadataOnly())
+    for wid in registry.worker_ids():
+      registry.set_status(wid, worker_registry.AdmissionStatus.ACTIVE)
     coordinator = weight_sync_coordinator.WeightSyncCoordinator(
         registry=registry, handler=FakeHandler(wire, []),
         timeouts=FAST_TIMEOUTS,
@@ -1052,6 +1062,7 @@ class ProtocolRejectionTest(CoordinatorTestBase):
     wire = Wire()
     registry = worker_registry.WorkerRegistry()
     registry.register(FakeSource("trainer", wire, []))
+    registry.set_status("trainer", worker_registry.AdmissionStatus.ACTIVE)
     coordinator = weight_sync_coordinator.WeightSyncCoordinator(
         registry=registry, handler=FakeHandler(wire, []),
         timeouts=FAST_TIMEOUTS,
@@ -1928,6 +1939,49 @@ class PhaseTimeoutsTest(absltest.TestCase):
 
     with self.assertRaises(ValueError):
       PhaseTimeouts.for_drain_timeout(0.0)
+
+
+class DestinationStatusFilterTest(CoordinatorTestBase):
+
+  def test_destination_statuses_filters_pending_weight_sync_workers(self):
+    d_active = FakeDestination("s-active", [])
+    d_pending = FakeDestination("s-pending", [])
+    self.make(d_active, d_pending)
+    self.registry.set_status(
+        "s-pending", worker_registry.AdmissionStatus.PENDING_WEIGHT_SYNC
+    )
+
+    # Default sync only targets ACTIVE destinations.
+    result_1 = self.sync(policy_version=1)
+    self.assertTrue(result_1.success)
+    self.assertEqual(d_active.serving, expected_pattern(1))
+    self.assertEqual(d_pending.serving, [0.0] * 4)
+    self.assertEqual([w.worker_id for w in result_1.workers], ["s-active"])
+
+    # Passing destination_statuses=(ACTIVE, PENDING_WEIGHT_SYNC) syncs both.
+    result_2 = asyncio.run(
+        self.coordinator.sync(
+            2,
+            destination_statuses=(
+                worker_registry.AdmissionStatus.ACTIVE,
+                worker_registry.AdmissionStatus.PENDING_WEIGHT_SYNC,
+            ),
+        )
+    )
+    self.assertTrue(result_2.success)
+    self.assertEqual(d_active.serving, expected_pattern(2))
+    self.assertEqual(d_pending.serving, expected_pattern(2))
+    self.assertEqual(
+        {w.worker_id: w.phase for w in result_2.workers},
+        {"s-active": "committed", "s-pending": "committed"},
+    )
+    self.assertEqual(
+        {w.worker_id: w.handle for w in result_2.workers},
+        {
+            "s-active": self.registry.handle("s-active"),
+            "s-pending": self.registry.handle("s-pending"),
+        },
+    )
 
 
 if __name__ == "__main__":
