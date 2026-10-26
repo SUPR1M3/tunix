@@ -79,7 +79,6 @@ class Scheduler:
     self._pending_requests: collections.deque[request_lib.RequestState] = (
         collections.deque()
     )
-    self._token_budget: int = 0
 
     self._kv_cache_manager = kv_cache_manager
 
@@ -124,12 +123,13 @@ class Scheduler:
 
     self._schedule_requests()
 
-    decodes = [r for r in self._running_requests if r.is_decode]
-    chunked = [r for r in self._running_requests if r.is_chunked_prefill]
+    # Skipped requests hold their place in the running queue, but sit out
+    # this step.
+    runnable = [r for r in self._running_requests if not r.is_skipped]
+    decodes = [r for r in runnable if r.is_decode]
+    chunked = [r for r in runnable if r.is_chunked_prefill]
     prefills = [
-        r
-        for r in self._running_requests
-        if not r.is_decode and not r.is_chunked_prefill
+        r for r in runnable if not r.is_decode and not r.is_chunked_prefill
     ]
 
     i = len(decodes)
@@ -138,6 +138,33 @@ class Scheduler:
 
     # The RPA kernel expects [decodes, chunked, prefills] ordering.
     return tuple(decodes + chunked + prefills), (i, j, k)
+
+  def drop_completed(
+      self,
+      scheduled: tuple[request_lib.RequestState, ...],
+      distribution: tuple[int, int, int],
+  ) -> tuple[tuple[request_lib.RequestState, ...], tuple[int, int, int]]:
+    """Drops finished or aborted requests from the queues and `scheduled`.
+
+    Args:
+      scheduled: The pre-scheduled batch `[decodes, chunked, prefills]`.
+      distribution: The `(i, j, k)` cumulative counts for `scheduled`.
+
+    Returns:
+      The filtered `(scheduled, distribution)` with done requests removed.
+    """
+    self._running_requests = self._drop_done(self._running_requests)
+    self._pending_requests = self._drop_done(self._pending_requests)
+
+    i, j, k = distribution
+    decodes = [r for r in scheduled[:i] if not r.is_done]
+    chunked = [r for r in scheduled[i:j] if not r.is_done]
+    prefills = [r for r in scheduled[j:k] if not r.is_done]
+
+    new_i = len(decodes)
+    new_j = new_i + len(chunked)
+    new_k = new_j + len(prefills)
+    return tuple(decodes + chunked + prefills), (new_i, new_j, new_k)
 
   def abort_request(self, req: request_lib.RequestState) -> None:
     """Aborts `req`. Has no effect if `req` is already done."""
@@ -162,25 +189,24 @@ class Scheduler:
     new_running_requests = []
     self._token_budget = self._config.max_num_batched_tokens
 
-    n_admitted_requests = 0
+    n_visited = 0
     while (
-        n_admitted_requests < len(requests)
+        n_visited < len(requests)
         and len(new_running_requests) < self._config.max_num_seqs
     ):
-      req = requests[n_admitted_requests]
-
-      scheduled = self._try_schedule_request(req, n_admitted_requests)
+      req = requests[n_visited]
+      scheduled = self._try_schedule_request(req, len(new_running_requests))
       if not scheduled:
         break
 
-      n_admitted_requests += 1
+      n_visited += 1
       new_running_requests.append(req)
 
-    while len(self._running_requests) > n_admitted_requests:
+    while len(self._running_requests) > len(new_running_requests):
       self._preempt()
 
     self._running_requests = collections.deque(new_running_requests)
-    self._pending_requests = collections.deque(requests[n_admitted_requests:])
+    self._pending_requests = collections.deque(requests[n_visited:])
 
   def _try_schedule_request(
       self,
@@ -188,10 +214,22 @@ class Scheduler:
       n_admitted_requests: int,
   ) -> bool:
     """Tries to schedule `req` for the next step."""
+    req.is_skipped = False
     n_tokens_hit, computed_pages = self._get_prefix_hit(req)
     is_decode, is_chunked_prefill, n_tokens_to_schedule, n_to_allocate = (
         self._get_n_tokens_to_schedule(req, n_tokens_hit)
     )
+
+    if req.num_stale_output_tokens > 0 and not is_chunked_prefill:
+      # A decode or full prefill would sample the positions that the in-flight
+      # output is about to fill, e.g. for a request preempted earlier in this
+      # same pass. Keep its place in the queue so later requests cannot jump
+      # ahead of it, but skip it until that output arrives. A chunked prefill
+      # only reads tokens that already exist, so it can run.
+      req.is_skipped = True
+      req.is_decode = False
+      req.is_chunked_prefill = False
+      return True
 
     if n_tokens_to_schedule > self._token_budget:
       return False
@@ -278,6 +316,8 @@ class Scheduler:
       self._preempt()
     for req in self._pending_requests:
       req.num_in_flight_tokens = 0
+      # The caller discards the in-flight step, so its output never arrives.
+      req.num_stale_output_tokens = 0
 
   def _preempt(self) -> None:
     """Moves the most recently admitted request to the front of pending."""
@@ -285,9 +325,13 @@ class Scheduler:
     self._kv_cache_manager.release_request(req)
 
     req.num_computed_tokens = 0
+    # Tokens an in-flight step is sampling are still appended when it
+    # returns, so the request waits for them before it samples again.
+    req.num_stale_output_tokens += req.num_in_flight_tokens
     req.num_in_flight_tokens = 0
     req.is_decode = False
     req.is_chunked_prefill = False
+    req.is_skipped = False
     req.status = request_lib.RequestStatus.PENDING
 
     self._pending_requests.appendleft(req)

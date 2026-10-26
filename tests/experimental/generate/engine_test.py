@@ -398,6 +398,36 @@ class StepTest(parameterized.TestCase):
     preempt_spy.assert_called()
     self.assertEqual(generated, [reference_generate(p) for p in prompts])
 
+  def test_preempted_while_in_flight_processes_generated_token(self):
+    # Two pages hold both 4-token prompts in step 1. When step 2 is scheduled
+    # while step 1 is still in flight, request '0' needs a second page and
+    # preempts request '1'. Request '1' must still process its generated token
+    # from step 1 and finish in that single step.
+    engine = testing_utils.make_engine(
+        max_model_len=5, max_device_size_gib=2 * testing_utils.GIB_PER_PAGE
+    )
+    preempt_spy = mock.patch.object(
+        engine._scheduler,  # pylint: disable=protected-access
+        '_preempt',
+        wraps=engine._scheduler._preempt,  # pylint: disable=protected-access
+    ).start()
+    p0 = [1, 2, 3, 4]
+    p1 = [5, 6, 7, 8]
+    engine.add_request(testing_utils.make_request('0', p0, max_tokens=1))
+    engine.add_request(testing_utils.make_request('1', p1, max_tokens=1))
+
+    outputs = {out.request_id: out for out in engine.step()}
+
+    preempt_spy.assert_called_once()
+    self.assertEqual(set(outputs.keys()), {'0', '1'})
+    self.assertEqual(
+        outputs['0'].token_ids.tolist(), reference_generate(p0, max_tokens=1)
+    )
+    self.assertEqual(
+        outputs['1'].token_ids.tolist(), reference_generate(p1, max_tokens=1)
+    )
+    self.assertFalse(engine.has_unfinished_requests())
+
   def test_prefix_cache_hit_skips_the_cached_tokens(self):
     engine = testing_utils.make_engine()
     prompt = list(range(1, 10))
@@ -427,6 +457,48 @@ class StepTest(parameterized.TestCase):
     )
     self.assertEqual(
         finished['second'].token_ids.tolist(), reference_generate([4, 5])
+    )
+
+  def test_schedules_next_step_while_model_forward_is_in_flight(self):
+    engine = testing_utils.make_engine()
+    events: list[str] = []
+
+    orig_execute = engine._model_runner.execute_step  # pylint: disable=protected-access
+    orig_schedule = engine._scheduler.schedule_step  # pylint: disable=protected-access
+    orig_update = engine._update_from_output  # pylint: disable=protected-access
+
+    def record_execute(*args, **kwargs):
+      events.append('execute')
+      return orig_execute(*args, **kwargs)
+
+    def record_schedule(*args, **kwargs):
+      events.append('schedule')
+      return orig_schedule(*args, **kwargs)
+
+    def record_update(*args, **kwargs):
+      events.append('update')
+      return orig_update(*args, **kwargs)
+
+    mock.patch.object(
+        engine._model_runner, 'execute_step', side_effect=record_execute  # pylint: disable=protected-access
+    ).start()
+    mock.patch.object(
+        engine._scheduler, 'schedule_step', side_effect=record_schedule  # pylint: disable=protected-access
+    ).start()
+    mock.patch.object(
+        engine, '_update_from_output', side_effect=record_update
+    ).start()
+
+    engine.add_request(testing_utils.make_request('0', [1, 2], max_tokens=2))
+    engine.step()
+    engine.step()
+
+    # Step 1 schedules and launches the initial batch, then schedules and
+    # launches Step 2 while Step 1 is in flight, before updating from Step 1's
+    # output. Step 2 finishes the already-launched second batch.
+    self.assertEqual(
+        events,
+        ['schedule', 'execute', 'schedule', 'execute', 'update', 'schedule', 'update'],
     )
 
   def test_returns_logits_and_logprobs(self):
